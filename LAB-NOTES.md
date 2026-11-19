@@ -153,10 +153,25 @@ Interpretation:
 and if the VR answers on the host SMBus it gives the undervolt with zero hardware risk. Only if the VR is SMC-private
 (unreachable) does a solder mod (remote-sense injection, or OFS if the pin exists) become the fallback.
 
-**Read-only test to run (CAREFUL — live production box):** the VR, if host-visible, is on an SMBus segment. Rather than
-an active `i2cdetect` scan (which issues quick-writes and can disturb SMBus/SMC devices), prefer passive discovery:
-check `sensors`/hwmon for an already-bound pmbus/VR device, `i2cdetect -l` for extra buses, and only then targeted
-read-only PMBus reads (VOUT_MODE 0x20, READ_VOUT 0x8B) at candidate VR addresses. Needs user go-ahead first.
+**Read-only reachability test — RUN 2026-11-19. RESULT: VR is NOT host-reachable → software PMBus path is DEAD.**
+Passive discovery on the live host (zero bus writes):
+- `i2cdetect -l`: host SMBus = `i2c-0` (i801); i2c-1..14 are all Radeon/GPU DDC buses (display, irrelevant).
+- Bound i2c clients on bus 0: only **`0-0052: spd`, `0-0053: spd`** (DIMM SPD/temp EEPROMs) — plus our clock gen at
+  0x69 (unbound, read manually). **No VR / no pmbus client anywhere.** No `pmbus`/`isl` module loaded; dmesg has no
+  VR hints.
+- hwmon: nvme, coretemp, radeon, and **`applesmc-isa-0300`**. CPU VCORE is NOT in any pmbus hwmon; the **SMC** owns the
+  management/sensor domain (huge applesmc sensor list) via the ISA interface, not the host SMBus.
+→ **Conclusion:** the ISL6367 is on a private bus behind Apple's **SMC**, invisible to the x86 OS. The PMBus
+  "overclocking" interface exists on the chip but is not wired anywhere the Proxmox host can reach it. So there is **no
+  software undervolt/overvolt path** — confirmed, not just assumed. (A targeted read-only probe of candidate VR
+  addresses on bus 0 is possible but unwarranted: the SMC-owns-VR architecture is clear and probing the live SPD/SMC
+  segment adds risk for ~no new information.)
+
+**Remaining voltage route = hardware only.** Options, both needing the physical board + the **820-5494-A boardview**
+(not obtainable from teardown photos): (1) remote-sense (VSEN/RTN) resistor injection to bias VCORE — finicky on a
+differential-sense SVID loop, trip/ brick risk; (2) OFS-pin resistor if the ISL6367 has an analog OFS pin (unconfirmed).
+Influencing the SMC firmware to command a VR offset is a dead end (Apple-locked, no documented interface). Net: a CPU
+**undervolt** on this machine is a hardware-mod-only proposition; **BCLK remains the one working (software) lever.**
 
 ## Open / next
 - [ ] Run `macpro-bclk.sh write 101` at a quiet window; measure effective MHz (aperf/TSC), watch for MCE/IO errors.
