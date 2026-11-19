@@ -1,0 +1,6 @@
+# runtime state / local artifacts
+bclk-stock-block.txt
+bench-results.json
+*.log
+__pycache__/
+*.pyc
