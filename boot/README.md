@@ -27,6 +27,25 @@ PLL relock dropped an in-flight write. It recovered cleanly (FS stayed rw, mount
 is the same mechanism that corrupted the FS when a step was done **under load**. A live step is never perfectly
 clean on this machine.
 
-**Fully-clean alternative (not yet built):** apply the BCLK from an **initramfs pre-mount hook**, before the root
-filesystem is mounted read-write — then there are no in-flight FS writes to lose. More robust, but an initramfs
-hang is harder to recover. Open an issue / see LAB-NOTES if you want this path.
+## initramfs pre-mount attempt — built, but blocked by hardware on this Mac
+
+The fully-clean idea is to apply the BCLK from an **initramfs pre-mount hook**, before the root filesystem is
+mounted read-write, so there are no in-flight FS writes for the PLL relock to drop. That hook is built and shipped
+in [`initramfs/`](initramfs/) (`hook-macpro-bclk`, `premount-macpro-bclk`, `install-initramfs.sh`), and it installs
+and runs correctly — but on the 2013 Mac Pro **it cannot actually program the clock that early**:
+
+> Tested across three boots (2026-11-19). At `init-premount` the i801 SMBus adapter **is** present and correctly
+> detected as bus 0, but every block read of the clock generator returns **empty** — tried with bus auto-detect by
+> name, 6× retries with settle, and `i2c_i801 disable_features=0x10` (polling mode, since IRQs aren't wired up
+> that early). The controller binds but its host transactions don't complete until later in OS boot (firmware/SMM
+> SMBus arbitration; ACPI is already up before initramfs, so it isn't an ACPI-timing issue).
+
+The hook is **fail-open**: on any read failure it logs to the kernel ring and boots stock, so it never hangs the
+boot and never leaves the box in a bad state. It is safe to leave installed (useful if a future kernel/firmware
+makes early SMBus access work). Escape hatch regardless: add `bclk=off` to the kernel cmdline at the GRUB edit
+screen.
+
+**Net on this machine:** the initramfs hook fails open → the **systemd service** (above) remains the working
+method, and it is the one that applies 104 MHz each boot (with the one benign, recovered I/O glitch noted above).
+To actually eliminate that glitch within the systemd path, the next idea is to `fsfreeze` the mounted
+filesystems for the ~1 s of the step (flush + block writes so none can be dropped) — not yet implemented.

@@ -273,3 +273,34 @@ built; documented in `boot/README.md`.
 
 **State:** box left at 104 MHz, service enabled, containers 111/112 running, healthy. Open improvement: initramfs
 pre-mount apply to eliminate the per-boot write glitch.
+
+---
+
+## INITRAMFS PRE-MOUNT ATTEMPT (2026-11-19) — built, blocked by early-boot SMBus
+
+**Goal:** eliminate the per-boot disk-write glitch by programming the clock gen before the root FS is mounted rw
+(no in-flight write for the PLL relock to drop).
+
+**Built & shipped** in `boot/initramfs/`: a `hook-macpro-bclk` (copies i2cget/i2cset + **libi2c.so.0** [copy_exec
+does NOT auto-pull it — added explicitly with its soname symlink] + i2c_i801/i2c_smbus modules + the TARGET conf
+into the image) and a POSIX-sh `premount-macpro-bclk` (init-premount; auto-detects the i801 bus by name, retries,
+steps 1 MHz, **fail-open** on any error, `bclk=off` cmdline escape hatch). `update-initramfs -u` on the GRUB-EFI
+box; verified all pieces baked into `/boot/initrd.img`.
+
+**Result — does NOT work on this Mac (3 test boots, consistent):** at `init-premount` the i801 adapter IS present
+and detected as bus 0, but the clock-gen block read returns **empty every time**. Ruled out:
+- bus renumbering (logged `i2c-0=[SMBus I801 adapter at 0000:00:1f.3]`, correct bus);
+- transient timing (6 retries × 1 s settle — all empty);
+- IRQ-not-wired (`modprobe i2c_i801 disable_features=0x10` = FEATURE_IRQ polling mode — still empty).
+ACPI is initialised before initramfs runs, so it's not ACPI timing → the i801 **host transactions don't complete
+until later in OS boot**, almost certainly firmware/SMM SMBus arbitration. The clock gen reads fine at runtime, so
+no hardware damage. **Conclusion: the SMBus clock gen is not programmable from the initramfs on this hardware.**
+
+**The hook is fail-open and safe to leave installed** (box always booted clean, zero I/O errors, EDAC 0, every
+test). Net: initramfs fails open → the **systemd service remains the working apply method** (combined design:
+initramfs tries first, systemd is the fallback that actually sets 104). Each test reboot took ~8 min (game
+containers are chronically slow to stop — the dominant friction all session).
+
+**Next idea to kill the glitch within the systemd path (not done):** `fsfreeze -f` the mounted FS(es) for the ~1 s
+of the step so no write can be in flight, then `fsfreeze -u`. Risk: freezing root mid-boot can deadlock; the glitch
+on sda1 means ALL rw mounts would need freezing. The glitch is benign (recovers every time), so this is optional.

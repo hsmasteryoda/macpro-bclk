@@ -1,0 +1,84 @@
+#!/bin/sh
+# initramfs-tools init-premount: apply BCLK before any FS is mounted rw, so a PLL relock cannot drop an
+# in-flight disk write. Steps 1 MHz at a time. Fail-open everywhere (never hang the boot).
+# Escape hatch: add 'bclk=off' to the kernel cmdline.
+PREREQ=""
+prereqs(){ echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+
+log(){ echo "macpro-bclk: $*"; echo "macpro-bclk: $*" > /dev/kmsg 2>/dev/null || true; }
+
+TARGET=104
+[ -r /etc/macpro-bclk.conf ] && . /etc/macpro-bclk.conf 2>/dev/null
+for tok in $(cat /proc/cmdline 2>/dev/null); do
+  case "$tok" in
+    bclk=off|bclk=no|bclk=0) log "disabled via kernel cmdline"; exit 0 ;;
+    bclk=*) TARGET="${tok#bclk=}" ;;
+  esac
+done
+case "$TARGET" in
+  100) log "target 100 (stock); nothing to do"; exit 0 ;;
+  101|102|103|104) ;;
+  *) log "invalid target '$TARGET'; booting stock"; exit 0 ;;
+esac
+
+# Force i801 POLLING mode (disable_features=0x10 = FEATURE_IRQ): early in boot the SMBus IRQ is not wired
+# up, so interrupt-driven block transactions time out (empty read). Polling works without IRQs.
+modprobe i2c_i801 disable_features=0x10 2>/dev/null || modprobe i2c_i801 2>/dev/null || true
+modprobe i2c_dev 2>/dev/null || true
+
+# Find the i801 SMBus adapter BY NAME (robust to bus renumbering); wait for it to appear.
+BUS=""; n=0
+while [ -z "$BUS" ] && [ "$n" -lt 8 ]; do
+  for d in /sys/class/i2c-dev/i2c-*; do
+    [ -r "$d/name" ] || continue
+    case "$(cat "$d/name" 2>/dev/null)" in
+      *I801*|*i801*) BUS="${d##*/i2c-}"; break ;;
+    esac
+  done
+  [ -z "$BUS" ] && { n=$((n+1)); sleep 1; }
+done
+adp=""; for d in /sys/class/i2c-dev/i2c-*; do [ -e "$d" ] && adp="$adp $(basename "$d")=[$(cat "$d/name" 2>/dev/null)]"; done
+log "i2c adapters:${adp:- none}"
+[ -n "$BUS" ] || { log "no I801 SMBus adapter found; booting stock"; exit 0; }
+log "using SMBus bus $BUS"
+
+GET=/usr/sbin/i2cget; SET=/usr/sbin/i2cset
+{ [ -x "$GET" ] && [ -x "$SET" ]; } || { log "i2c-tools missing; booting stock"; exit 0; }
+
+# Read the clockgen block, retrying (the SMBus controller may need a moment right after init).
+blk=""; n=0
+while [ "$n" -lt 6 ]; do
+  blk=$("$GET" -y "$BUS" 0x69 0x00 s 2>/dev/null)
+  [ "$(echo "$blk" | wc -w)" -ge 10 ] && break
+  n=$((n+1)); sleep 1
+done
+[ "$(echo "$blk" | wc -w)" -ge 10 ] || { log "clockgen read failed after retries (got: '$blk'); booting stock"; exit 0; }
+
+b9=$(echo "$blk" | cut -d' ' -f10)
+[ "$(( b9 ))" -eq "$(( 0x35 ))" ] || { log "device id $b9 != 0x35; booting stock"; exit 0; }
+b6=$(echo "$blk" | cut -d' ' -f7); cur=$(( 97 + ( b6 & 7 ) ))
+{ [ "$cur" -ge 97 ] && [ "$cur" -le 104 ]; } || { log "freq out of range (byte6=$b6); booting stock"; exit 0; }
+[ "$cur" -ge "$TARGET" ] && { log "already at ${cur} MHz (>= target ${TARGET}); nothing to do"; exit 0; }
+
+log "pre-mount apply: ${cur} -> ${TARGET} MHz on bus ${BUS} (no FS mounted rw)"
+while [ "$cur" -lt "$TARGET" ]; do
+  nxt=$(( cur + 1 ))
+  blk=$("$GET" -y "$BUS" 0x69 0x00 s 2>/dev/null)
+  [ "$(echo "$blk" | wc -w)" -ge 10 ] || { log "read failed mid-step; stopping at ${cur}"; break; }
+  out=""; idx=0
+  for x in $blk; do
+    case "$idx" in
+      1) x=$(printf '0x%02x' "$(( x | 0x80 ))") ;;
+      6) x=$(printf '0x%02x' "$(( ( x & ~7 ) | ( nxt - 97 ) ))") ;;
+    esac
+    out="$out $x"; idx=$(( idx + 1 ))
+  done
+  "$SET" -y "$BUS" 0x69 0x00 $out s 2>/dev/null
+  sleep 1
+  blk=$("$GET" -y "$BUS" 0x69 0x00 s 2>/dev/null)
+  b6=$(echo "$blk" | cut -d' ' -f7); cur=$(( 97 + ( b6 & 7 ) ))
+  log "  stepped to ${cur} MHz"
+done
+log "done: BCLK now ${cur} MHz"
+exit 0

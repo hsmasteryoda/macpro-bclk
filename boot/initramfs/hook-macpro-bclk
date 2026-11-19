@@ -1,0 +1,28 @@
+#!/bin/sh
+# initramfs-tools HOOK: include i2c-tools + libi2c + SMBus modules + the BCLK target in the image.
+PREREQ=""
+prereqs(){ echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+. /usr/share/initramfs-tools/hook-functions
+
+copy_exec /usr/sbin/i2cget
+copy_exec /usr/sbin/i2cset
+
+# libi2c.so.0 is NOT reliably auto-resolved by copy_exec -> copy the real object + recreate its soname symlink.
+LIBREAL=$(readlink -f /usr/lib/x86_64-linux-gnu/libi2c.so.0 2>/dev/null)
+[ -e "$LIBREAL" ] || LIBREAL=$(readlink -f /lib/x86_64-linux-gnu/libi2c.so.0 2>/dev/null)
+if [ -n "$LIBREAL" ] && [ -e "$LIBREAL" ]; then
+  copy_exec "$LIBREAL"
+  LIBDIR=$(dirname "$LIBREAL")
+  mkdir -p "${DESTDIR}${LIBDIR}"
+  ln -sf "$(basename "$LIBREAL")" "${DESTDIR}${LIBDIR}/libi2c.so.0"
+fi
+
+# SMBus controller (+ smbus helper). i2c-dev is builtin on this kernel, so it is not added here.
+manual_add_modules i2c_i801
+manual_add_modules i2c_smbus
+
+if [ -r /etc/default/macpro-bclk ]; then
+  cp /etc/default/macpro-bclk "${DESTDIR}/etc/macpro-bclk.conf"
+fi
+exit 0
