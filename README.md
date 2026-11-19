@@ -76,6 +76,22 @@ Full sweep on an **idle** box (all-core clock = ratio 30 × BCLK):
 > 3. Watch for **I/O errors**, not just ECC — storage is a BCLK-sensitive failure mode (the stability test
 >    now counts them).
 
+## Boot persistence (confirmed working)
+
+BCLK is **volatile** — a cold power-off restores 100 MHz. The [`boot/`](boot/) directory ships a crash-loop-guarded
+systemd service that re-applies the overclock at **early boot, before the game containers start** — which (on a box
+with no EFI hook available) is the only reasonably-idle moment for a live clock write.
+
+```bash
+cd boot && sudo ./install.sh     # applies TARGET MHz (default 104) on next boot
+```
+
+Validated on real hardware 2026-11-19: the service applied **104 MHz at boot** (`103 -> 104, done`), the box came
+up stable with containers running, EDAC 0, temps cool. **Caveat:** the step moment produced two *transient* disk
+I/O errors (a dropped in-flight write during the PLL relock) that recovered cleanly — the same glitch mechanism
+that corrupted the FS under load, just benign here. A live step is never perfectly clean on this machine; the
+fully-clean fix is a pre-mount initramfs hook (not yet built). See [`boot/README.md`](boot/README.md).
+
 ## Quickstart
 
 On the Mac Pro / Linux host, as root:

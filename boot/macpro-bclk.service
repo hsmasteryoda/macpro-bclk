@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply Mac Pro 6,1 BCLK overclock at boot (idle, crash-loop guarded)
+Documentation=https://github.com/hsmasteryoda/macpro-bclk
+After=local-fs.target systemd-modules-load.service
+Before=pve-guests.service
+ConditionPathExists=/var/lib/macpro-bclk/enabled
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/macpro-bclk-apply.sh
+
+[Install]
+WantedBy=multi-user.target

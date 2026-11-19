@@ -230,3 +230,46 @@ once recovered: 104 MHz applied at boot (idle), or stay stock — the +4% is mod
 - Firmware dump + analysis tools: project `x99/biostools/` (ucode_scan.py, fit_parse.py, dxe_msr_analyze.py),
   writeup `x99/biostools/FINDINGS.md`. Live MSR/SMBus probes run over SSH (read-only unless noted).
 - Datasheets (clock gen / VRM) and PPM disassembly captured during the second-opinion research pass.
+
+---
+
+## BOOT-PERSISTENCE RUN + FINAL NUMBERS (2026-11-19)
+
+**Goal:** make 104 MHz survive reboots, and read the real RAM/CPU speeds at the overclock.
+
+**Why the service is the application method, not just persistence.** Repeated attempts to live-step to 104 over SSH
+*kept hanging the box* — not because of the frequency (104 is stable once running) but because the box was never
+*truly* idle: residual I/O right after `pct shutdown`, or game-server load, meant the PLL relock glitched an
+in-flight operation and wedged it. Lesson reconfirmed ~3× today: **a live BCLK up-step is only safe on a genuinely
+quiescent box.** Early boot (before `pve-guests.service`) is the most-quiescent realistic moment, so that is where
+the overclock is applied.
+
+**The service (`boot/`):** `macpro-bclk-apply.sh` (oneshot) + `macpro-bclk.service`
+(`After=local-fs.target systemd-modules-load.service`, `Before=pve-guests.service`,
+`ConditionPathExists=/var/lib/macpro-bclk/enabled`). Steps 1 MHz at a time, device-id checked, target clamped
+100–104, config in `/etc/default/macpro-bclk` (`TARGET=104`). **Crash-loop guard:** writes `attempting` to
+`/var/lib/macpro-bclk/last-attempt` + `sync` before stepping; if a boot hangs mid-step the marker survives and the
+*next* boot SKIPS — so a bad step can never boot-loop the host. Confirmed in the boot log:
+`boot apply: 103 -> 104 MHz (stepping)` → `stepped to 104` → `done: BCLK now 104 MHz`; marker `ok`, service active.
+
+**⚠️ New finding — the boot step still glitches one disk write.** At the exact second of the step (11:02:48):
+```
+Buffer I/O error on dev sda1 ... lost sync page write
+JBD2: I/O error when updating journal superblock for sda1-8
+```
+Root fs is `ext4 ... errors=remount-ro` and it did NOT remount-ro; FS mounted clean, coreutils OK, EDAC 0, nothing
+accumulated after boot → **benign, but it is the same PLL-relock mechanism that corrupted the FS under load in the
+earlier incident.** Even an early-boot live step is not perfectly clean on this box. The fully-clean path is to
+apply BCLK from an **initramfs pre-mount hook** (root not yet mounted rw → no in-flight FS write to lose) — not yet
+built; documented in `boot/README.md`.
+
+**Final measured numbers at 104 BCLK (+4%):**
+- **RAM:** 4× 32 GB **DDR3-1066 ECC** = 128 GB (125 GB usable). SPD module speed 1066 MT/s; Apple SMBIOS reports
+  `Configured Memory Speed: Unknown`. At 104 BCLK the memory clock scales +4% → **~1109 MT/s**. (RAM cannot be
+  decoupled — on-die IMC on the host clock — so this +4% is unavoidable and is the real ceiling; ECC clean at 104.)
+- **CPU (E5-2697 v2):** base 27× = **2808 MHz** (was 2700); all-core turbo 30× = **3120 MHz** nominal
+  (measured **~2781 MHz** under a full 24-thread power-limited load); max 1-core turbo 35× = **3640 MHz** (was 3500).
+- **Thermals:** pkg 48–54 °C under load, RAM TM0P/TM1P 40–42 °C. Huge margin.
+
+**State:** box left at 104 MHz, service enabled, containers 111/112 running, healthy. Open improvement: initramfs
+pre-mount apply to eliminate the per-boot write glitch.
