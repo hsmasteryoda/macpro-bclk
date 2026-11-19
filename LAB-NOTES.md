@@ -304,3 +304,33 @@ containers are chronically slow to stop — the dominant friction all session).
 **Next idea to kill the glitch within the systemd path (not done):** `fsfreeze -f` the mounted FS(es) for the ~1 s
 of the step so no write can be in flight, then `fsfreeze -u`. Risk: freezing root mid-boot can deadlock; the glitch
 on sda1 means ALL rw mounts would need freezing. The glitch is benign (recovers every time), so this is optional.
+
+---
+
+## FSFREEZE GLITCH PROTECTION (2026-11-19) — glitch solved, but the step-hang is the PLL, not disk I/O
+
+**Goal:** eliminate the per-boot dropped-write glitch within the (working) systemd apply, since the initramfs path
+is blocked by early-boot SMBus. Idea: freeze the filesystems for the ~1 s of each step so no in-flight write can be
+dropped by the PLL relock.
+
+**Implemented** in `boot/macpro-bclk-apply.sh`: per step → `sync` → `fsfreeze -f` each rw ext4/xfs mount (here: `/`
+[pve-root] and `/mnt/backup` [sda1, the original glitch target]) → `i2cset` relock → `sleep 1` (held frozen) →
+`fsfreeze -u`. Since fsfreeze + its libs live on the frozen FS, ALL frozen-window tools (fsfreeze, i2cset, sleep +
+libs + ld-linux) are **staged into tmpfs** (/dev/shm) and invoked via the tmpfs loader (`ld-linux --library-path
+$STAGE $STAGE/<tool>`), so the window never touches a frozen FS. Backstops: a **tmpfs watchdog** that
+force-unfreezes after 15 s, and a `trap cleanup EXIT INT TERM`. **Runtime-tested first** (no reboot): freeze `/`
+63 ms / unfreeze 3 ms, `/mnt/backup` 38 ms / 5 ms, both writable after, box alive — fsfreeze is safe on this box.
+
+**Result (reboot test):**
+- ✅ **Glitch eliminated** — the boot that stepped the clock showed **0 I/O errors** (vs 2 before), FS clean, no
+  stuck freeze (both mounts writable after), tmpfs staging auto-cleaned.
+- ❌ **Did NOT stop the hang** — the apply stepped 102→103 fine, then **103→104 hung the box anyway** (guard caught
+  it on the auto-reset → landed stable at 103). So **the step-hang is the PLL relock wedging, NOT an FS-I/O
+  collision** — fsfreeze can't fix it; only pre-boot firmware could. Hang point varies (102→103 one boot,
+  103→104 another) → it's a low-probability per-step PLL relock failure.
+
+**Conclusion / op point:** live stepping to the top of the table is a ~coin-flip; **104 is stable once running**
+(25-min full-stress proof) but reaching it live is unreliable. **Set TARGET=103** = reliable, glitch-free **+3 %**
+(RAM ~1098 MT/s, CPU base 2781 / all-core ~2862 / 1-core turbo 3605), a clean no-op on warm reboots. 104 only if you
+accept an occasional extra hang-reset per boot (guard-safe, glitch-free). Combined boot design now: initramfs tries
+(fails open on this HW) → systemd fsfreeze-protected apply sets the target. Committed+pushed.

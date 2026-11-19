@@ -6,8 +6,8 @@ only reasonably-idle moment for a live clock write.
 
 ```bash
 sudo ./install.sh          # install + enable; applies on next boot
-# edit the target (100..104):
-sudo sed -i 's/^TARGET=.*/TARGET=104/' /etc/default/macpro-bclk
+# edit the target (100..104). TARGET=103 is the recommended reliable ceiling on this box (see below):
+sudo sed -i 's/^TARGET=.*/TARGET=103/' /etc/default/macpro-bclk
 ```
 
 **Files:** `macpro-bclk-apply.sh` → `/usr/local/sbin/`, `macpro-bclk.service` → `/etc/systemd/system/`,
@@ -18,14 +18,30 @@ sudo sed -i 's/^TARGET=.*/TARGET=104/' /etc/default/macpro-bclk
   and `sync`s. If a boot ever hangs mid-step, the marker survives the reboot and the **next boot SKIPS** applying
   (so a bad step can never boot-loop the machine). Re-arm with `echo ready > /var/lib/macpro-bclk/last-attempt`.
 - **Steps 1 MHz at a time** with a 1 s settle, device-id checked (`byte9==0x35`), target clamped 100–104.
+- **fsfreeze glitch protection (implemented).** Each step runs `sync` → `fsfreeze -f` on every rw ext4/xfs mount →
+  the `i2cset` relock → settle → `fsfreeze -u`, so there is **no in-flight disk write for the PLL relock to drop**.
+  Because `fsfreeze` and its libraries live on the frozen filesystems, all frozen-window tools (`fsfreeze`,
+  `i2cset`, `sleep` + libs + loader) are staged into **tmpfs** (`/dev/shm`) and run from there, with a tmpfs
+  **watchdog** that force-unfreezes after 15 s if anything stalls, plus a trap that unfreezes on any exit. Validated
+  on real hardware: freeze ~40–65 ms, unfreeze ~3–5 ms, and the boot that used it showed **zero I/O errors**.
 - **Easy kill switch:** `rm /var/lib/macpro-bclk/enabled` disables it without touching systemd.
 
-## Known limitation — a live step can still glitch a disk write
-Validated 2026-11-19: applying 104 at boot worked and the box is stable, **but the step moment produced two
-transient I/O errors** (`Buffer I/O error on sda1 ... lost sync page write` / `JBD2 ... journal superblock`) as the
-PLL relock dropped an in-flight write. It recovered cleanly (FS stayed rw, mounted clean, no accumulation), but it
-is the same mechanism that corrupted the FS when a step was done **under load**. A live step is never perfectly
-clean on this machine.
+## What's clean, and what isn't — the step-hang is the PLL, not disk I/O
+Validated 2026-11-19 across several boots:
+
+- **The I/O glitch is solved.** Before fsfreeze, a step dropped an in-flight write (`Buffer I/O error on sda1 ...
+  lost sync page write` / `JBD2 ... journal superblock`). With fsfreeze, boots that step the clock show **0 I/O
+  errors** and the filesystems stay clean. No corruption risk.
+- **But the live step is still probabilistically flaky.** fsfreeze did **not** stop the box from occasionally
+  hanging on a step (it hit 102→103 on one boot, 103→104 on another) — so the hang is the **PLL relock itself
+  wedging**, not an FS-I/O collision. Only pre-boot firmware could fully quiesce that, and the SMBus isn't
+  reachable pre-mount here (see below).
+- **It's safe regardless.** The crash-loop guard turns any hang into a one-shot reset that lands on a stable,
+  glitch-free frequency (102–104) instead of a boot-loop or a corruption. **104 is stable once running** (survived
+  25 min of full 24-core stress), but reaching it live is a ~coin-flip on the top step.
+- **Recommendation: `TARGET=103`** — a reliable, glitch-free **+3 %** that avoids the flaky top step (and is a
+  clean no-op on a warm reboot, since the clock is preserved). Set `TARGET=104` only if you'll accept an occasional
+  extra hang-reset per boot before it settles.
 
 ## initramfs pre-mount attempt — built, but blocked by hardware on this Mac
 
@@ -46,6 +62,6 @@ makes early SMBus access work). Escape hatch regardless: add `bclk=off` to the k
 screen.
 
 **Net on this machine:** the initramfs hook fails open → the **systemd service** (above) remains the working
-method, and it is the one that applies 104 MHz each boot (with the one benign, recovered I/O glitch noted above).
-To actually eliminate that glitch within the systemd path, the next idea is to `fsfreeze` the mounted
-filesystems for the ~1 s of the step (flush + block writes so none can be dropped) — not yet implemented.
+method. The glitch it used to produce is now eliminated by the fsfreeze protection in the apply script (see
+"Safety design"); the only residual is the occasional PLL-relock hang on the top step, which the crash-loop guard
+handles safely. `TARGET=103` sidesteps it for a clean, reliable, glitch-free overclock.
