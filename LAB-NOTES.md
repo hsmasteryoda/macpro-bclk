@@ -112,6 +112,52 @@ solder mod for it?" Honest engineering answer:
     fine SMD rework, real brick risk. This is the one hardware mod with genuine payoff (matches the DayZ-efficiency
     goal). First step is read-only: confirm the controller part and locate its FB/offset network from teardown photos.
 
+## VRM / ISL6367 voltage control — research (2026-11-19)
+Goal: a hardware (or better, software) route to the CPU undervolt that the CPU's own interfaces can't do on IVB-EP.
+
+**Part confirmed.** Two independent teardowns (iFixit #20778; manuals.plus guide) identify the Mac Pro 6,1 CPU VRM
+controller as the **Intersil/Renesas ISL6367** — "Green Hybrid Digital Dual 6+1 Phase PWM Controller for VR12/IMVP7,
+with SMBus/PMBus/I2C." 60-lead QFN. 6-phase output VR0 = CPU core (or memory); 1-phase VR1 = GPU/SA/VCCIO. Now
+obsolete; full datasheet (FN7884) is gated ("request from Intersil"). Only the 2-page data-short is public.
+
+**Key line from the data-short (changes the plan):** *"It includes programmable functions and telemetries… and
+**overclocking applications using SMBus, PMBus, or I2C (Modified) interface, which is designed to be conflict free with
+CPU's SVID bus.**"* Plus "SerialVID with Programmable IMAX, TMAX, BOOT, **ADDRESS OFFSET** Registers."
+
+Interpretation:
+- The ISL6367 has an **independent SMBus/PMBus register interface, explicitly for overclocking, that does NOT fight
+  the CPU's SVID bus.** So a **software voltage offset (undervolt/overvolt) may be possible with NO soldering** — not
+  via the CPU (which has no OC mailbox on IVB-EP), but by commanding the **VR chip directly over PMBus.** This partially
+  overturns the earlier "no software undervolt" verdict: it was true for CPU-side interfaces, but the VR itself has a
+  back door. (The "ADDRESS OFFSET" register is the SVID *bus-address* offset, not a voltage offset — don't confuse them;
+  the voltage-offset capability is the separate PMBus/overclocking register set, whose map is in the gated full datasheet.)
+- **The catch — reachability.** This only works if the ISL6367's PMBus pins are wired to a bus the Proxmox host can see
+  (e.g. the PCH i801 SMBus where the clock gen lives at 0x69, or a muxed segment), rather than to Apple's **SMC** on a
+  private bus. On most Macs the VR telemetry goes to the SMC, not the host PCH — so this may be unreachable from the OS.
+  **This is the decisive unknown, and it's testable READ-ONLY** (see below).
+
+**Solder-mod reality (the original question):**
+- Classic Intersil **OFS-pin** undervolt: on sibling analog parts (ISL6313/6333/6264) a resistor on the OFS pin sets a
+  DC offset — OFS→GND raises VCORE, OFS→VCC lowers it (undervolt); `Voffset = Ioffset × RFB`, `ROFS = Vref×RFB/Voffset`
+  (Vref 0.3V to GND / 1.6V to VCC on ISL6313; 1.2V on ISL6264). **BUT** I could not confirm the ISL6367 even has an
+  *analog* OFS pin — VR12/SVID parts generally moved offset into **digital registers** (the PMBus path above), which fits
+  this part's "overclocking over PMBus" pitch. So the clean solder mod may not exist; the intended knob is PMBus.
+- **Remote-sense (VSEN/RTN/VDIFF) injection mod:** universal to analog-sense VRs — add a resistor to bias the sense node
+  and the loop regulates to a shifted VCORE. On a ±0.5% differential-remote-sense SVID part with droop, this is finicky
+  and can trip protection; high brick risk. Last resort.
+- **Reading resistor values/locations off teardown photos is NOT feasible** — iFixit's Mac Pro 2013 shots aren't macro
+  board-level images with legible 0402 markings. Any solder mod needs the **820-5494-A boardview/schematic** (Rossmann
+  community has an 820-5494-A thread) or the physical board under a scope. Photo-only identification is a dead end.
+
+**Verdict / priority flip:** before any soldering, test the **software PMBus path** — it's non-destructive, reversible,
+and if the VR answers on the host SMBus it gives the undervolt with zero hardware risk. Only if the VR is SMC-private
+(unreachable) does a solder mod (remote-sense injection, or OFS if the pin exists) become the fallback.
+
+**Read-only test to run (CAREFUL — live production box):** the VR, if host-visible, is on an SMBus segment. Rather than
+an active `i2cdetect` scan (which issues quick-writes and can disturb SMBus/SMC devices), prefer passive discovery:
+check `sensors`/hwmon for an already-bound pmbus/VR device, `i2cdetect -l` for extra buses, and only then targeted
+read-only PMBus reads (VOUT_MODE 0x20, READ_VOUT 0x8B) at candidate VR addresses. Needs user go-ahead first.
+
 ## Open / next
 - [ ] Run `macpro-bclk.sh write 101` at a quiet window; measure effective MHz (aperf/TSC), watch for MCE/IO errors.
 - [ ] If stable, step to 102/103; find the ceiling where POST/IO/stability breaks.
