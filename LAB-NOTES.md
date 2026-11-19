@@ -173,6 +173,51 @@ differential-sense SVID loop, trip/ brick risk; (2) OFS-pin resistor if the ISL6
 Influencing the SMC firmware to command a VR offset is a dead end (Apple-locked, no documented interface). Net: a CPU
 **undervolt** on this machine is a hardware-mod-only proposition; **BCLK remains the one working (software) lever.**
 
+## LIVE OC RUN + RESULTS + INCIDENT (2026-11-19)
+First real on-hardware run. Validated 100–104 MHz, found the register ceiling, and **caused a storage incident**
+via unclean crash-reboots. Full record below — read the SAFETY lessons before ever writing BCLK live again.
+
+### Validated results (idle box, game containers stopped)
+Actual all-core clock = ratio 30 × BCLK (all-core turbo); single-core turbo = 35 × BCLK.
+
+| BCLK | all-core clock | CPU (stress-ng bogo-ops/s) | RAM stream | pkg temp | RAM temp (TM0P/1P) | stability | ΔCE/UE |
+|------|---------------|----------------------------|-----------|----------|--------------------|-----------|--------|
+| 100 (stock) | 3000 MHz | 16570 | 543.8 | 51 °C | ~38–40 °C | — | 0/0 |
+| 101 | 3030 | 16837 (+1.6%) | 549.3 (+1.0%) | 54 °C | — | PASS | 0/0 |
+| 102 | 3060 | 17153 (+3.5%) | 553.6 (+1.8%) | 56 °C | — | PASS | 0/0 |
+| 103 | 3090 | 17405 (+5.0%) | 559.5 (+2.9%) | 58 °C | — | PASS | 0/0 |
+| **104** | **3120** | **17760 (+7.2%)** | **565.6 (+4.0%)** | 59 °C | — | PASS | 0/0 |
+
+- **RAM bandwidth scales almost exactly with BCLK (+4.0% at +4%)** — clean end-to-end proof the OC is real.
+  CPU bogo-ops % is noisier (stock baseline taken with boot-load still decaying); treat RAM scaling as truth.
+- Temps had huge headroom throughout (pkg peak 59 °C, crit 99 °C). RAM temps TM0P≈38 °C / TM1P≈40 °C idle.
+- **104 MHz is the ceiling of the frequency register.** byte6 is a 3-bit field (bits[2:0], 97–104 = sel 0–7);
+  it increments linearly 0x13→0x17 for 100→104. Writing **0x18** (sel wraps to 0, bit3 set = non-freq control)
+  **HUNG the box** → warm reboot. So 104 is the max via the documented field; higher needs the undocumented
+  M/N PLL bytes (byte2=0x8f/byte3=0x14) — not attempted after the incident.
+- The CPU showed **zero** instability across 100–104 — we ran out of register range, not silicon headroom.
+
+### SAFETY lessons (critical — bake into the tool)
+1. **NEVER write BCLK while the box is under load.** The first 102 write happened under game-server load (~16)
+   + a stress run and **crashed the box instantly**. The same 102, written at idle, was rock-stable. The live
+   PLL relock under load is the killer, not the target frequency.
+2. **Unclean crashes corrupt the filesystem.** Two crash-reboots (102-under-load, 0x18) left the **root ext4 /
+   NVMe returning read errors** (EIO/SIGBUS on tail, seq, head, grep, awk, dd, sync…). Overclocking a host whose
+   boot disk is on the same box is a genuine data-integrity risk. (`drop_caches` during diagnosis made it worse
+   by evicting still-cached working binaries — never do that on a box with a suspect disk.)
+3. **Watch for I/O errors, not just ECC.** Storage is a BCLK-sensitive failure mode; a stability test must grep
+   dmesg for `I/O error`/EXT4/NVMe resets, and abort on any.
+4. **Apply at boot, idle, before services start — not live under load.** The only safe persistence model is a
+   systemd oneshot very early in boot (idle) OR just leave it volatile. No live writes on a loaded production box.
+5. **Cap target at 104.** byte6 ≥ 0x18 hangs; refuse it.
+
+### Incident status / recovery
+Clock restored to 100 (stock) before stopping. Root FS throwing EIO across many /usr/bin binaries → box needs a
+**cold power-cycle + forced fsck** (`fsck.mode=force fsck.repair=yes`, or rescue-USB `fsck -yf /dev/mapper/pve-root`),
+then `apt install --reinstall coreutils` and `smartctl -a /dev/nvme0`. Data expected intact (unclean-reboot FS
+inconsistency, not necessarily a dead drive). User is power-cycling at the console. **Recommended operating point
+once recovered: 104 MHz applied at boot (idle), or stay stock — the +4% is modest vs the risk on a production host.**
+
 ## Open / next
 - [ ] Run `macpro-bclk.sh write 101` at a quiet window; measure effective MHz (aperf/TSC), watch for MCE/IO errors.
 - [ ] If stable, step to 102/103; find the ceiling where POST/IO/stability breaks.

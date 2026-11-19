@@ -30,7 +30,7 @@ from urllib.parse import urlparse, parse_qs
 BUS = int(os.environ.get("BCLK_BUS", "0"))
 ADDR = 0x69
 EXPECT_DEV = 0x35
-FREQ_MIN, FREQ_MAX = 100, 110
+FREQ_MIN, FREQ_MAX = 100, 104   # 104 = hard ceiling: byte6 >= 0x18 (sel wrap + bit3) HANGS the box (verified)
 STOCK_MHZ = 100
 LOG = os.environ.get("BCLK_LOG", "/var/log/macpro-bclk.log")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -112,6 +112,11 @@ def write_mhz(target):
     if not d["device_ok"]:
         return False, f"device id {d['device']} != expected 0x{EXPECT_DEV:02x}; refusing to write"
     cur = d["mhz"]
+    if target > cur:
+        la = loadavg1()
+        if la is not None and la > NPROC * 0.5:
+            return False, (f"load {la:.1f} too high (> {NPROC // 2}) for a live up-step — a BCLK write under "
+                           f"load crashed this box (and corrupted the FS). Quiesce it (stop heavy guests) first.")
     if abs(target - cur) > 1:
         return False, f"refusing a {target - cur:+d} MHz jump from {cur}; step 1 MHz at a time"
     if not os.path.exists(STOCK_BLOCK_FILE):
@@ -135,20 +140,42 @@ def write_mhz(target):
     logline(f"  readback byte6=0x{d2.get('byte6',0):02x} -> {d2.get('mhz')} MHz  effMHz_after={after}")
     return True, f"set {target} MHz (eff {before}->{after} MHz). Watch stability & journalctl -k."
 
-# ------------------------------------------------------------------ error/MCE monitoring
+# ------------------------------------------------------------------ monitoring helpers
+def loadavg1():
+    try:
+        return float(open("/proc/loadavg").read().split()[0])
+    except Exception:
+        return None
+
+def allcore_mhz():
+    """Average core clock across all CPUs (= ratio x BCLK under full load). Clean OC signal."""
+    try:
+        v = [float(m) for m in re.findall(r"cpu MHz\s*:\s*([\d.]+)", open("/proc/cpuinfo").read())]
+        return round(sum(v) / len(v)) if v else None
+    except OSError:
+        return None
+
+def ram_temp():
+    """Hottest DIMM proximity temp (applesmc TM0P/TM1P) in C, or None."""
+    if not have("sensors"):
+        return None
+    t = [float(x) for x in re.findall(r"^TM[01]P:\s*\+?([\d.]+)", sh(["sensors"]).stdout, re.M)]
+    return max(t) if t else None
+
 def mce_snapshot():
-    """Count hardware-error indicators (EDAC corrected/uncorrected + kernel MCE log lines)."""
+    """Hardware-error indicators: EDAC CE/UE, kernel MCE log lines, and I/O/FS errors (a BCLK failure mode)."""
     edac = 0
     for f in glob.glob("/sys/devices/system/edac/mc/mc*/ce_count") + glob.glob("/sys/devices/system/edac/mc/mc*/ue_count"):
         try:
             edac += int(open(f).read().strip())
         except (OSError, ValueError):
             pass
-    mce = 0
+    mce = io = 0
     r = sh(["dmesg", "--notime"], timeout=8)
     if r.returncode == 0:
         mce = len(re.findall(r"(?i)machine check|\bmce:|hardware error|corrected error|uncorrected", r.stdout))
-    return {"edac": edac, "mce_log": mce}
+        io = len(re.findall(r"(?i)i/o error|EXT4-fs error|nvme.*(?:timeout|reset|controller is down)", r.stdout))
+    return {"edac": edac, "mce_log": mce, "io": io}
 
 # ------------------------------------------------------------------ job runner (one at a time)
 JOB = {"running": False, "kind": None, "started": 0, "timeout": 0, "output": "", "result": None, "proc": None}
@@ -201,11 +228,13 @@ def _worker(kind, cmd, secs, stability):
         extra = {"scores": scores, "ram_MBps": rate, "secs": secs}
         if stability:
             after = mce_snapshot()
-            new_err = (after["edac"] - before["edac"]) + max(0, after["mce_log"] - before["mce_log"])
+            new_io = max(0, after.get("io", 0) - before.get("io", 0))
+            new_err = (after["edac"] - before["edac"]) + max(0, after["mce_log"] - before["mce_log"]) + new_io
             completed = rc == 0
             verdict = "PASS" if (completed and new_err == 0) else "FAIL"
-            extra.update({"mce_before": before, "mce_after": after, "new_errors": new_err,
-                         "completed": completed, "verdict": verdict})
+            extra.update({"mce_before": before, "mce_after": after, "new_errors": new_err, "new_io": new_io,
+                         "completed": completed, "verdict": verdict,
+                         "peak_ram_temp": ram_temp(), "allcore_mhz": allcore_mhz()})
         _finish(kind, rc, extra)
     except Exception as e:
         _append(f"\n[job error] {e}\n")
@@ -306,7 +335,8 @@ input[type=number]{background:#0b0d12;border:1px solid var(--line);color:var(--f
 <div class=card>
   <div class=row><div class=grow><div class=k>Base clock</div><div class=big id=bclk>—<span class=unit> MHz</span></div></div>
   <div><div class=k>Effective CPU</div><div class=big id=eff>—<span class=unit> MHz</span></div></div></div>
-  <div class=row style=margin-top:10px><span class=pill id=dev>device —</span><span class=pill id=ven>vendor —</span><span class=pill id=write>write —</span></div>
+  <div class=row style=margin-top:6px><span class=pill id=acm>all-core —</span><span class=pill id=rtemp>RAM —</span><span class=pill id=ld>load —</span></div>
+  <div class=row style=margin-top:6px><span class=pill id=dev>device —</span><span class=pill id=ven>vendor —</span><span class=pill id=write>write —</span></div>
   <div class="k mono" id=raw style=margin-top:10px></div>
 </div>
 <div class=card>
@@ -361,14 +391,19 @@ function paintStatus(d){
     if(target===null)target=cur;}
   else{$('bclk').textContent='n/a';$('raw').textContent=(d.clock&&d.clock.error)||'read failed';}
   $('eff').innerHTML=(d.eff_mhz||'—')+'<span class=unit> MHz</span>';
-  writeEnabled=d.write_enabled;
+  $('acm').textContent='all-core '+(d.allcore_mhz?d.allcore_mhz+' MHz':'—');
+  $('rtemp').textContent='RAM '+(d.ram_temp!=null?d.ram_temp.toFixed(0)+'°C':'—');
+  const hot=d.load!=null&&d.nproc&&d.load>d.nproc*0.5;
+  $('ld').innerHTML='load '+(d.load!=null?d.load.toFixed(1):'—')+(hot?' <span class=bad>(too high to OC)</span>':'');
+  writeEnabled=d.write_enabled; window._loadHot=hot;
   $('write').innerHTML='write '+(d.write_enabled?'<span class=warn>armed on server</span>':'<span class=k>disabled</span>');
   if(d.verified)$('unverified').style.display='none';
   $('target').textContent=target===null?'—':target;gate();
   if(d.log)$('log').textContent=d.log;
 }
 function gate(){
-  $('apply').disabled=!(writeEnabled&&$('armchk').checked&&target!==null&&cur!==null&&Math.abs(target-cur)<=1&&target!==cur);
+  const upBlocked=(target>cur)&&window._loadHot;   // never write BCLK up under load
+  $('apply').disabled=!(writeEnabled&&$('armchk').checked&&target!==null&&cur!==null&&Math.abs(target-cur)<=1&&target!==cur&&!upBlocked);
   $('sgo').disabled=!$('sarm').checked;
 }
 function fmtScore(r){
@@ -388,7 +423,8 @@ function paintJob(j){
   $('joblog').textContent=j.output||'idle';
   if(j.result&&j.result.kind==='stability'){const r=j.result;
     $('sverdict').innerHTML=`<b class="${r.verdict==='PASS'?'ok':'bad'}">${r.verdict}</b> — `+
-      `completed ${r.completed}, new hardware errors ${r.new_errors} (EDAC ${r.mce_after.edac-r.mce_before.edac}, MCE-log ${r.mce_after.mce_log-r.mce_before.mce_log})`;}
+      `completed ${r.completed}, new errors ${r.new_errors} (EDAC ${r.mce_after.edac-r.mce_before.edac}, MCE ${r.mce_after.mce_log-r.mce_before.mce_log}, I/O ${r.new_io||0})`+
+      (r.peak_ram_temp!=null?` · RAM ${r.peak_ram_temp}°C`:'')+(r.allcore_mhz?` · all-core ${r.allcore_mhz} MHz`:'');}
 }
 async function refresh(){try{
   const s=await (await fetch('/api/status')).json();paintStatus(s);
@@ -396,7 +432,7 @@ async function refresh(){try{
   paintHist(await (await fetch('/api/history')).json());
 }catch(e){}}
 $('minus').onclick=()=>{if(target!==null){target=Math.max(100,target-1);$('target').textContent=target;gate();}};
-$('plus').onclick=()=>{if(target!==null){target=Math.min(110,target+1);$('target').textContent=target;gate();}};
+$('plus').onclick=()=>{if(target!==null){target=Math.min(104,target+1);$('target').textContent=target;gate();}};
 $('armchk').onchange=gate;$('sarm').onchange=gate;
 $('apply').onclick=async()=>{if(!confirm('Set BCLK to '+target+' MHz on the LIVE machine?'))return;
   $('msg').textContent='applying…';const r=await (await fetch('/api/write?mhz='+target,{method:'POST'})).json();
@@ -427,6 +463,7 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, PAGE, "text/html; charset=utf-8")
         if p == "/api/status":
             return self._send(200, json.dumps({"clock": decode(read_block()), "eff_mhz": effective_mhz(),
+                "allcore_mhz": allcore_mhz(), "ram_temp": ram_temp(), "load": loadavg1(), "nproc": NPROC,
                 "write_enabled": ALLOW_WRITE, "verified": verified(), "log": tail_log()}))
         if p == "/api/job":
             return self._send(200, json.dumps(job_status()))

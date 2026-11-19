@@ -48,6 +48,34 @@ Full reasoning in [`LAB-NOTES.md`](LAB-NOTES.md).
 
 ---
 
+## Validated results (2026-11-19, on real hardware)
+
+Full sweep on an **idle** box (all-core clock = ratio 30 × BCLK):
+
+| BCLK | all-core clock | CPU (stress-ng) | RAM bandwidth | pkg temp | stability | ECC/MCE/IO |
+|------|---------------|-----------------|---------------|----------|-----------|------------|
+| 100 (stock) | 3000 MHz | 16570 bogo-ops/s | 543.8 | 51 °C | — | 0 |
+| 101 | 3030 | +1.6% | +1.0% | 54 °C | PASS | 0 |
+| 102 | 3060 | +3.5% | +1.8% | 56 °C | PASS | 0 |
+| 103 | 3090 | +5.0% | +2.9% | 58 °C | PASS | 0 |
+| **104** | **3120** | **+7.2%** | **+4.0%** | 59 °C | PASS | 0 |
+
+- **RAM bandwidth scales almost exactly with BCLK** (+4.0 % at +4 %) — clean proof the overclock is real.
+- **104 MHz is the hard ceiling.** The frequency byte (byte6) is a 3-bit field; the next value (0x18) flips a
+  non-frequency control bit and **hangs the box**. The tools refuse anything above 104.
+- The CPU showed **zero** instability across the whole range — we ran out of register range, not silicon headroom.
+- Temps had huge margin (59 °C peak vs 99 °C crit); RAM (TM0P/TM1P) stayed ~38–40 °C.
+
+> **⚠️ Incident during testing — read this.** Writing BCLK **live while the box was under load** hung it
+> instantly, and the resulting **unclean reboots corrupted the root filesystem** (I/O errors across many
+> binaries; recovered with a cold power-cycle + fsck, no lasting damage). The *same* frequencies written at
+> **idle** were rock-stable. Lessons, now enforced by the tools:
+> 1. **Never write BCLK up while the machine is under load.** The tools refuse an up-step when load > ½ the core
+>    count (override `BCLK_FORCE=1` only if truly idle).
+> 2. **Overclocking a host that boots from its own disk risks your data.** Have backups.
+> 3. Watch for **I/O errors**, not just ECC — storage is a BCLK-sensitive failure mode (the stability test
+>    now counts them).
+
 ## Quickstart
 
 On the Mac Pro / Linux host, as root:

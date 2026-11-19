@@ -8,8 +8,17 @@
 # The 435's exact table is UNVERIFIED (no public datasheet); treat the first write as experimental.
 #
 # READ-ONLY by default. `write`/`restore` change the LIVE clock and can hang the box, glitch IO
-# (PCIe/DMI/SATA/TB and RAM all scale with BCLK), and skew timekeeping. Run writes only with no players
-# on and the ability to power-cycle. The setting is volatile: a full power-off restores 100 MHz.
+# (PCIe/DMI/SATA/TB and RAM all scale with BCLK), and skew timekeeping. The setting is volatile: a full
+# power-off restores 100 MHz.
+#
+# HARD-WON SAFETY RULES (2026-11-19 live run - see LAB-NOTES.md):
+#   * NEVER write BCLK while the box is under load. A live write under load HUNG the box instantly; the
+#     SAME frequency written at idle was rock-stable. This script refuses upward writes when load is high
+#     (override with BCLK_FORCE=1 only if you know the box is actually idle).
+#   * Unclean crash-reboots from a bad write CORRUPTED the root filesystem. Overclocking a host that boots
+#     from the same disk is a real data-integrity risk. Have backups; prefer applying at idle boot.
+#   * Validated ceiling is 104 MHz (+4%). byte6>=0x18 hangs. 100-104 all stable at idle; CPU had headroom
+#     to spare - we ran out of register range, not silicon. Watch dmesg for I/O errors, not just ECC.
 #
 # Usage:
 #   ./macpro-bclk.sh read                 # safe: dump + decode the clock gen register block
@@ -44,14 +53,15 @@ decode(){ # args: block bytes
   printf '  byte9=0x%02x  device id (%s)\n' "$b9" "$([ "$b9" -eq $((EXPECT_DEV)) ] && echo '932SQL435' || echo '?')"
 }
 
-measure(){ # effective MHz via aperf/mperf if turbostat present, else /proc/cpuinfo
-  if command -v turbostat >/dev/null; then
-    turbostat --quiet --show Bzy_MHz,TSC_MHz --num_iterations 1 --interval 1 2>/dev/null | head -3
-  else
-    log "turbostat not installed; falling back to /proc/cpuinfo (less precise)"
-    grep -m1 'cpu MHz' /proc/cpuinfo
-    log "TSC: $(dmesg 2>/dev/null | grep -m1 -i 'tsc.*MHz' || echo 'n/a')"
+measure(){ # actual all-core clock (= ratio x BCLK under load), CPU + RAM temps, and I/O-error watch
+  awk '/cpu MHz/{s+=$4;n++} END{if(n)printf "all-core avg MHz (current load): %.0f\n", s/n}' /proc/cpuinfo
+  printf 'single-core peak MHz: %s\n' "$(awk '/cpu MHz/{print $4}' /proc/cpuinfo | sort -n | tail -1)"
+  if command -v sensors >/dev/null; then
+    sensors 2>/dev/null | awk '/Package id 0/{print "pkg temp: "$4}'
+    sensors 2>/dev/null | grep -E '^TM0P:|^TM1P:' | sed 's/:  */: /;s/^/RAM temp /'
   fi
+  local io; io=$(dmesg --notime 2>/dev/null | grep -ciE 'i/o error|EXT4-fs error|nvme.*(timeout|reset)')
+  printf 'kernel I/O/FS errors in dmesg: %s%s\n' "${io:-?}" "$([ "${io:-0}" -gt 0 ] 2>/dev/null && echo '  <-- STOP: storage is erroring, restore 100 and check the disk')"
 }
 
 do_write(){ # arg: target MHz 100..104
@@ -66,6 +76,16 @@ do_write(){ # arg: target MHz 100..104
   (( cur < 97 || cur > 104 )) && { log "ABORT: current freq sel out of range (byte6=0x$(printf %02x $b6))"; exit 1; }
   local delta=$(( target - cur )); local ad=${delta#-}
   (( ad > 1 )) && { log "ABORT: refusing a $delta MHz jump from ${cur}. Step 1 MHz at a time."; exit 1; }
+  # LOAD GUARD: a live upward BCLK write under load HUNG the box (and the crash corrupted the FS).
+  # Refuse upward writes when load is high; downward/restore always allowed. Override: BCLK_FORCE=1.
+  if (( target > cur )); then
+    local load1 ncpu; load1=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null); ncpu=$(nproc 2>/dev/null || echo 4)
+    if [ "${BCLK_FORCE:-0}" != 1 ] && awk "BEGIN{exit !(${load1:-0} > $ncpu*0.5)}"; then
+      log "ABORT: load ${load1} too high (> ${ncpu}/2 cores) for a live upward BCLK write."
+      log "       A live write under load crashed this box before. Quiesce it, or set BCLK_FORCE=1 if truly idle."
+      exit 1
+    fi
+  fi
   # back up the stock block once
   [ -f "$BK" ] || { printf '%s\n' "${B[*]}" > "$BK"; log "saved stock block to $BK: ${B[*]}"; }
   # new byte6: keep high bits, set freq sel = target-97 ; set byte1 latch bit 0x80 (per firmware)
