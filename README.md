@@ -8,8 +8,37 @@ overclock lever that *is* reachable from the OS — the base clock (BCLK) — by
 generator over SMBus, and ships tooling to drive it safely and measure the result.
 
 > ⚠️ **Experimental. Overclocking can crash the machine and, in rare cases, corrupt data or damage hardware.**
-> The write path was reverse-engineered and is guarded, but had not been validated on real hardware at first
-> release. Use at your own risk, ideally not on a box anyone depends on. See **Safety**.
+> The write path was reverse-engineered and **has now been validated on real hardware** (a 2013 Mac Pro 6,1
+> running Proxmox). Use at your own risk, and keep backups of anything the box holds. See **Safety**.
+
+---
+
+## TL;DR — how to overclock your Mac Pro
+
+Validated outcome on real hardware: a **reliable, glitch-free +3 % (BCLK 103 MHz)** that re-applies on every boot.
+104 is reachable and stable at speed but the live step to it is flaky (see [Validated results](#validated-results-2026-11-19-on-real-hardware)), so **103 is the recommended ceiling**.
+
+**1. Try it live (one step, reversible — the setting is volatile, a power-off restores 100):**
+```bash
+sudo apt-get install -y i2c-tools stress-ng
+sudo ./macpro-bclk.sh read            # confirm the clock gen (byte9=0x35, byte6=0x13 = 100 MHz)
+sudo ./macpro-bclk.sh write 101       # step up 1 MHz — ONLY on an idle box
+sudo ./macpro-bclk.sh measure         # confirm it rose; watch for errors
+# repeat write 102 / 103; restore with ./macpro-bclk.sh restore (or just power-cycle)
+```
+
+**2. Make it stick across reboots (recommended — fsfreeze-protected, crash-loop-guarded):**
+```bash
+cd boot
+sudo sed -i 's/^TARGET=.*/TARGET=103/' macpro-bclk.default   # (103 is already the default)
+sudo ./install.sh        # installs + enables the systemd service; applies 103 at every boot
+```
+That's it. Full detail, safety design, and the kill switch are in [`boot/README.md`](boot/README.md). To undo:
+`sudo rm /var/lib/macpro-bclk/enabled` (disable) or `sudo systemctl disable --now macpro-bclk.service`.
+
+> **Why only a live write, never pre-boot?** The cleanest place to set the clock is an initramfs hook before the
+> filesystem mounts — that's built (`boot/initramfs/`) but the i801 SMBus isn't reachable that early on this Mac, so
+> it fails open and the **systemd service** does the job instead. Details below and in `boot/README.md`.
 
 ---
 
@@ -76,21 +105,36 @@ Full sweep on an **idle** box (all-core clock = ratio 30 × BCLK):
 > 3. Watch for **I/O errors**, not just ECC — storage is a BCLK-sensitive failure mode (the stability test
 >    now counts them).
 
+### Recommended operating point: 103 MHz (+3 %)
+
+Further testing refined the picture:
+
+- **104 is stable *once running*** — it survived **~25 minutes of full 24-core `stress-ng` with zero errors**. The
+  silicon is fine at 104.
+- **But reaching 104 via a live step is a coin-flip.** Any 1 MHz step can occasionally wedge the **PLL relock** and
+  hang the box (seen at 102→103 on one boot, 103→104 on another). This is *not* a disk-I/O collision — `fsfreeze`ing
+  the filesystems during the step (now implemented) **eliminated the I/O glitch** but did **not** stop the hang, so
+  the hang is the PLL relock itself, which only pre-boot firmware could fully avoid.
+- **The crash-loop guard makes any outcome safe** — a hung step becomes a one-shot reset that lands on a stable,
+  glitch-free frequency (102–104) instead of a boot-loop or corruption.
+
+**So the sweet spot is `TARGET=103`:** a reliable, glitch-free **+3 %** that avoids the flaky top step. Set
+`TARGET=104` only if you'll tolerate an occasional extra reset per boot before it settles.
+
 ## Boot persistence (confirmed working)
 
-BCLK is **volatile** — a cold power-off restores 100 MHz. The [`boot/`](boot/) directory ships a crash-loop-guarded
-systemd service that re-applies the overclock at **early boot, before the game containers start** — which (on a box
-with no EFI hook available) is the only reasonably-idle moment for a live clock write.
+BCLK is **volatile** — a cold power-off restores 100 MHz. The [`boot/`](boot/) directory ships a crash-loop-guarded,
+**fsfreeze-protected** systemd service that re-applies the overclock at **early boot, before the game containers
+start**. Each step freezes the filesystems for the ~1 s PLL relock (tools staged in tmpfs, watchdog backstop) so no
+in-flight disk write can be dropped — boots that step the clock now show **zero I/O errors**.
 
 ```bash
-cd boot && sudo ./install.sh     # applies TARGET MHz (default 104) on next boot
+cd boot && sudo ./install.sh     # applies TARGET MHz (default 103) on next boot
 ```
 
-Validated on real hardware 2026-11-19: the service applied **104 MHz at boot** (`103 -> 104, done`), the box came
-up stable with containers running, EDAC 0, temps cool. **Caveat:** the step moment produced two *transient* disk
-I/O errors (a dropped in-flight write during the PLL relock) that recovered cleanly — the same glitch mechanism
-that corrupted the FS under load, just benign here. A live step is never perfectly clean on this machine; the
-fully-clean fix is a pre-mount initramfs hook (not yet built). See [`boot/README.md`](boot/README.md).
+A fully pre-boot path (`boot/initramfs/`) is also built, but the i801 SMBus isn't reachable at `init-premount` on
+this Mac (the adapter binds yet block reads return empty — firmware/SMM arbitration), so it **fails open** and the
+systemd service does the work. Full design, findings, and the kill switch: [`boot/README.md`](boot/README.md).
 
 ## Quickstart
 
@@ -114,9 +158,11 @@ sudo python3 macpro-bclk-gui.py --allow-write
 ssh -L 8099:localhost:8099 root@<macpro-ip>
 # then open http://localhost:8099
 ```
-The GUI has three tabs — **Overclock** (read/step BCLK), **Benchmark** (CPU/RAM, with a BCLK-tagged results
-table), **Stability** (PASS/FAIL). Writes and the stability test are each gated behind a "maintenance window"
-checkbox and a confirm dialog.
+The GUI has three tabs — **Overclock** (read/step BCLK live, **and manage boot persistence**: enable/disable the
+systemd service and set the boot target, with the current state and 103 recommendation shown), **Benchmark**
+(CPU/RAM, with a BCLK-tagged results table), **Stability** (PASS/FAIL). Writes and the stability test are each gated
+behind a "maintenance window" checkbox and a confirm dialog. So the GUI covers everything: live stepping,
+benchmarking, stability validation, and persistent boot-time overclocking.
 
 ### CLI
 ```bash
@@ -154,7 +200,10 @@ checkbox and a confirm dialog.
 |---|---|
 | `macpro-bclk-gui.py` | Local web GUI: BCLK read/step + CPU/RAM benchmarks + stability tester. Python stdlib only. |
 | `macpro-bclk.sh` | CLI for the same BCLK read/step. |
-| `LAB-NOTES.md` | Full reverse-engineering notebook: MSRs, firmware dump, dead-ends with evidence, the BCLK confirmation, clock-domain decoupling analysis, hardware-mod notes. |
+| `boot/` | **Boot persistence.** `install.sh` + `macpro-bclk-apply.sh` (fsfreeze-protected, crash-loop-guarded apply) + `macpro-bclk.service` + `macpro-bclk.default` (`TARGET=`). See [`boot/README.md`](boot/README.md). |
+| `boot/initramfs/` | Pre-mount apply hook (built; fails open on this Mac — SMBus unreachable that early). `install-initramfs.sh`. |
+| `LAB-NOTES.md` | Full reverse-engineering notebook: MSRs, firmware dump, dead-ends with evidence, the BCLK confirmation, clock-domain decoupling, the live-OC run + incident, boot persistence, initramfs attempt, and the fsfreeze/PLL-hang findings. |
+| `docs/ISL6367-datashort.pdf` | VRM controller datasheet (for the undervolt dead-end analysis). |
 | `bclk-stock-block.txt` | Auto-saved stock clock-gen register block (created on first write). *gitignored.* |
 | `bench-results.json` | Benchmark/stability history. *gitignored.* |
 

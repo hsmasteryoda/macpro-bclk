@@ -299,6 +299,65 @@ def tail_log(n=30):
     except OSError:
         return "(no log yet)"
 
+# ------------------------------------------------------------------ boot persistence
+SERVICE = "macpro-bclk.service"
+DEFAULT_FILE = "/etc/default/macpro-bclk"
+ENABLED_MARK = "/var/lib/macpro-bclk/enabled"
+ATTEMPT_MARK = "/var/lib/macpro-bclk/last-attempt"
+REC_TARGET = 103   # reliable, glitch-free ceiling on this hardware (104's top step can hang the PLL)
+
+def persist_status():
+    """State of the fsfreeze-protected systemd boot service (see boot/)."""
+    installed = os.path.exists(f"/etc/systemd/system/{SERVICE}") or os.path.exists(f"/lib/systemd/system/{SERVICE}")
+    target = None
+    try:
+        m = re.search(r"^TARGET=(\d+)", open(DEFAULT_FILE).read(), re.M)
+        if m:
+            target = int(m.group(1))
+    except OSError:
+        pass
+    marker = None
+    try:
+        marker = open(ATTEMPT_MARK).read().strip()
+    except OSError:
+        pass
+    svc_enabled = svc_active = None
+    if have("systemctl"):
+        svc_enabled = sh(["systemctl", "is-enabled", SERVICE]).stdout.strip() or None
+        svc_active = sh(["systemctl", "is-active", SERVICE]).stdout.strip() or None
+    return {"installed": installed, "enabled": os.path.exists(ENABLED_MARK), "target": target,
+            "marker": marker, "svc_enabled": svc_enabled, "svc_active": svc_active, "rec_target": REC_TARGET}
+
+def persist_set(action, value=None):
+    if not ALLOW_WRITE:
+        return False, "writes disabled (start with sudo ... --allow-write)"
+    if not persist_status()["installed"]:
+        return False, "boot service not installed — run `sudo boot/install.sh` once first"
+    try:
+        os.makedirs("/var/lib/macpro-bclk", exist_ok=True)
+        if action == "enable":
+            open(ATTEMPT_MARK, "w").write("ready\n"); open(ENABLED_MARK, "w").write("")
+            logline("persistence ENABLED via GUI")
+            return True, "boot persistence enabled — applies on next boot"
+        if action == "disable":
+            if os.path.exists(ENABLED_MARK):
+                os.remove(ENABLED_MARK)
+            logline("persistence DISABLED via GUI")
+            return True, "boot persistence disabled — OC will not re-apply at boot"
+        if action == "target":
+            v = int(value)
+            if not (FREQ_MIN <= v <= FREQ_MAX):
+                return False, f"target {v} out of range {FREQ_MIN}-{FREQ_MAX}"
+            txt = open(DEFAULT_FILE).read() if os.path.exists(DEFAULT_FILE) else ""
+            txt = re.sub(r"^TARGET=.*$", f"TARGET={v}", txt, flags=re.M) if re.search(r"^TARGET=", txt, re.M) else (txt + f"\nTARGET={v}\n").lstrip("\n")
+            open(DEFAULT_FILE, "w").write(txt)
+            open(ATTEMPT_MARK, "w").write("ready\n")   # re-arm so the new target is attempted
+            logline(f"persistence TARGET set to {v} via GUI")
+            return True, f"boot target set to {v} MHz — applies on next boot" + (" (recommended)" if v == REC_TARGET else "")
+    except (OSError, ValueError, TypeError) as e:
+        return False, f"persistence {action} failed: {e}"
+    return False, f"unknown action {action}"
+
 # ------------------------------------------------------------------ page
 PAGE = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>Mac Pro BCLK</title>
@@ -331,7 +390,7 @@ input[type=number]{background:#0b0d12;border:1px solid var(--line);color:var(--f
 
 <!-- OVERCLOCK -->
 <div id=tab-oc>
-<div class=banner id=unverified>⚠ Write path is <b>UNVERIFIED</b> on this hardware. The first successful write clears this. Step only at a maintenance window with no players, with the ability to power-cycle. The setting is volatile — a power-cycle restores 100 MHz.</div>
+<div class=banner id=unverified>⚠ A write is a <b>live</b> base-clock change — only at a maintenance window with no players, with the ability to power-cycle (the setting is volatile; a power-cycle restores 100 MHz). Step 1 MHz at a time. <b>103 MHz is the recommended reliable ceiling</b> — 104 is stable at speed but its top step can hang the PLL (the boot service recovers from that; a manual live write won't).</div>
 <div class=card>
   <div class=row><div class=grow><div class=k>Base clock</div><div class=big id=bclk>—<span class=unit> MHz</span></div></div>
   <div><div class=k>Effective CPU</div><div class=big id=eff>—<span class=unit> MHz</span></div></div></div>
@@ -346,6 +405,19 @@ input[type=number]{background:#0b0d12;border:1px solid var(--line);color:var(--f
   <div class=arm><input type=checkbox id=armchk><label for=armchk>Maintenance window (no players) and I can power-cycle.</label></div>
   <div class=row><button class=apply id=apply disabled>Apply target</button><button class=restore id=restore>Restore 100 MHz</button>
     <span class=grow></span><span id=msg class=k></span></div>
+</div>
+<div class=card id=persistcard>
+  <div class=row><div class=grow><div class=k>Boot persistence (survives reboot, fsfreeze-protected)</div>
+    <div id=pstate style="font-size:18px;font-weight:600;margin-top:2px">—</div>
+    <div class="k mono" id=pdetail style=margin-top:4px></div></div></div>
+  <div class=row style=margin-top:10px>
+    <label class=k>Boot target
+      <select id=ptarget><option>100</option><option>101</option><option>102</option><option>103</option><option>104</option></select> MHz</label>
+    <button id=psettarget>Set boot target</button>
+    <span class=grow></span>
+    <button id=penable class=apply>Enable</button><button id=pdisable class=restore>Disable</button></div>
+  <div class=k id=pmsg style=margin-top:8px></div>
+  <div class=sub style=margin-top:4px>103 is the recommended reliable ceiling. Install once with <span class=mono>sudo boot/install.sh</span>.</div>
 </div></div>
 
 <!-- BENCHMARK -->
@@ -426,10 +498,20 @@ function paintJob(j){
       `completed ${r.completed}, new errors ${r.new_errors} (EDAC ${r.mce_after.edac-r.mce_before.edac}, MCE ${r.mce_after.mce_log-r.mce_before.mce_log}, I/O ${r.new_io||0})`+
       (r.peak_ram_temp!=null?` · RAM ${r.peak_ram_temp}°C`:'')+(r.allcore_mhz?` · all-core ${r.allcore_mhz} MHz`:'');}
 }
+function paintPersist(p){
+  if(!p.installed){$('pstate').innerHTML='<span class=warn>not installed</span>';
+    $('pdetail').textContent='run  sudo boot/install.sh  once to enable boot persistence';return;}
+  $('pstate').innerHTML=(p.enabled?'<span class=ok>ENABLED</span>':'<span class=k>disabled</span>')+
+    ' · boot target <b>'+(p.target!=null?p.target+' MHz':'?')+'</b>'+
+    (p.target===p.rec_target?' <span class=ok>(recommended)</span>':(p.target===104?' <span class=warn>(104 top step can hang)</span>':''));
+  $('pdetail').textContent='service '+(p.svc_enabled||'?')+' / '+(p.svc_active||'?')+' · last-attempt: '+(p.marker||'—');
+  if(p.target!=null&&!window._ptouched)$('ptarget').value=p.target;
+}
 async function refresh(){try{
   const s=await (await fetch('/api/status')).json();paintStatus(s);
   const j=await (await fetch('/api/job')).json();paintJob(j);
   paintHist(await (await fetch('/api/history')).json());
+  paintPersist(await (await fetch('/api/persist')).json());
 }catch(e){}}
 $('minus').onclick=()=>{if(target!==null){target=Math.max(100,target-1);$('target').textContent=target;gate();}};
 $('plus').onclick=()=>{if(target!==null){target=Math.min(104,target+1);$('target').textContent=target;gate();}};
@@ -446,6 +528,12 @@ $('bram').onclick=()=>startBench('ram','bsecs');
 $('sgo').onclick=async()=>{if(!confirm('Run stability test for '+$('ssecs').value+'s? Full load + verify.'))return;
   await fetch('/api/bench/stability?secs='+$('ssecs').value,{method:'POST'});refresh();};
 $('bstop').onclick=$('sstop').onclick=async()=>{await fetch('/api/job/stop',{method:'POST'});refresh();};
+$('ptarget').onchange=()=>{window._ptouched=true;};
+async function persist(action,value){const q=value!=null?('&value='+value):'';
+  const r=await (await fetch('/api/persist?action='+action+q,{method:'POST'})).json();$('pmsg').textContent=r.message||'';window._ptouched=false;refresh();}
+$('penable').onclick=()=>persist('enable');
+$('pdisable').onclick=()=>{if(confirm('Disable boot persistence? The overclock will NOT re-apply after a reboot.'))persist('disable');};
+$('psettarget').onclick=()=>persist('target',$('ptarget').value);
 refresh();setInterval(refresh,2000);
 </script></body></html>"""
 
@@ -469,6 +557,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(job_status()))
         if p == "/api/history":
             return self._send(200, json.dumps(history()))
+        if p == "/api/persist":
+            return self._send(200, json.dumps(persist_status()))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
@@ -486,6 +576,9 @@ class H(BaseHTTPRequestHandler):
             ok, msg = start_job(kind, secs); return self._send(200, json.dumps({"ok": ok, "message": msg}))
         if p == "/api/job/stop":
             ok, msg = stop_job(); return self._send(200, json.dumps({"ok": ok, "message": msg}))
+        if p == "/api/persist":
+            ok, msg = persist_set(q.get("action", [""])[0], q.get("value", [None])[0])
+            return self._send(200, json.dumps({"ok": ok, "message": msg}))
         return self._send(404, json.dumps({"error": "not found"}))
 
 def main():
