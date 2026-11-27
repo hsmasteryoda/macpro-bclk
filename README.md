@@ -128,6 +128,14 @@ BCLK is **volatile** — a cold power-off restores 100 MHz. The [`boot/`](boot/)
 start**. Each step freezes the filesystems for the ~1 s PLL relock (tools staged in tmpfs, watchdog backstop) so no
 in-flight disk write can be dropped — boots that step the clock now show **zero I/O errors**.
 
+**Clocksource after a stepping boot (found 2026-11-27):** the kernel calibrates the TSC before the service runs, so
+on a boot that has to step the clock (after a cold power-off) the TSC then ticks ~2-3 % faster than calibrated. The
+kernel's clocksource watchdog catches it ("Marking TSC unstable due to clocksource watchdog") and switches to
+**HPET**: time stays correct (chrony fine), but HPET is much slower to read, which costs CPU on clock-heavy workloads
+like game servers. **Fix: one warm reboot** — the clock gen keeps its value, the kernel calibrates the TSC at the
+overclocked rate (e.g. 2781 MHz at 103) and keeps it, and the service is a no-op. Check:
+`cat /sys/devices/system/clocksource/clocksource0/current_clocksource` should say `tsc`.
+
 ```bash
 cd boot && sudo ./install.sh     # applies TARGET MHz (default 103) on next boot
 ```
