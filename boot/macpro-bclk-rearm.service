@@ -1,0 +1,8 @@
+[Unit]
+Description=Re-arm the Mac Pro BCLK boot apply after a guarded skip (2 h stable)
+Documentation=https://github.com/hsmasteryoda/macpro-bclk
+ConditionPathExists=/var/lib/macpro-bclk/enabled
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/macpro-bclk-rearm.sh

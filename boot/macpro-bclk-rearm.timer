@@ -1,0 +1,8 @@
+[Unit]
+Description=Re-arm the Mac Pro BCLK boot apply 2 h after boot
+
+[Timer]
+OnBootSec=2h
+
+[Install]
+WantedBy=timers.target

@@ -16,7 +16,9 @@ sudo sed -i 's/^TARGET=.*/TARGET=103/' /etc/default/macpro-bclk
 ## Safety design
 - **Crash-loop guard.** Before stepping, the script writes `attempting` to `/var/lib/macpro-bclk/last-attempt`
   and `sync`s. If a boot ever hangs mid-step, the marker survives the reboot and the **next boot SKIPS** applying
-  (so a bad step can never boot-loop the machine). Re-arm with `echo ready > /var/lib/macpro-bclk/last-attempt`.
+  (so a bad step can never boot-loop the machine). Re-arm with `echo ready > /var/lib/macpro-bclk/last-attempt`;
+  `macpro-bclk-rearm.timer` does that by itself once a skipped boot has stayed up 2 h, so the next boot tries again
+  (no boot loop possible: at most one attempt per boot, and only after 2 h of uptime).
 - **Steps 1 MHz at a time** with a 1 s settle, device-id checked (`byte9==0x35`), target clamped 100–104.
 - **fsfreeze glitch protection (implemented).** Each step runs `sync` → `fsfreeze -f` on every rw ext4/xfs mount →
   the `i2cset` relock → settle → `fsfreeze -u`, so there is **no in-flight disk write for the PLL relock to drop**.
