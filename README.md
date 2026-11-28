@@ -136,6 +136,14 @@ like game servers. **Fix: one warm reboot** — the clock gen keeps its value, t
 overclocked rate (e.g. 2781 MHz at 103) and keeps it, and the service is a no-op. Check:
 `cat /sys/devices/system/clocksource/clocksource0/current_clocksource` should say `tsc`.
 
+**USB 3 drops at the step (found 2026-11-28):** the CPU's PCIe root port `00:01.0` feeds the Fresco FL1100 USB 3
+controller and Thunderbolt. Both stepping boots (11-19 and 11-27) logged `xhci_hcd 0000:12:00.0: AER: can't recover`
+at the step second. On 11-27 the USB backup stick dropped a minute later and did not come back after a warm reboot,
+an xhci rebind, a PCI remove/rescan, a bus reset or a port reset. The Fresco root hub has no per-port power switching,
+so only a re-plug fixes it. Since 11-28 the apply script **unmounts `/mnt/backup` and unbinds every `xhci_hcd`
+controller before the step, then rebinds and remounts after** (log lines `USB 3 guard: ...`). Untested on a real
+stepping boot yet; the next one is the first test. CPU/RAM stability is unaffected; this is an I/O side effect.
+
 ```bash
 cd boot && sudo ./install.sh     # applies TARGET MHz (default 103) on next boot
 ```

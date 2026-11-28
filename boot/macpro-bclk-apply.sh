@@ -44,7 +44,8 @@ rr(){ local b="$1"; shift; "$LD" --library-path "$STAGE" "$STAGE/$b" "$@"; }   #
 # rw real filesystems to freeze during each step
 FZ=$(awk '$3 ~ /^(ext4|xfs)$/ && $4 ~ /(^|,)rw(,|$)/ {print $2}' /proc/mounts)
 FROZEN=""; WD=""
-cleanup(){ for m in $FROZEN; do rr fsfreeze -u "$m" 2>/dev/null; done; FROZEN=""; [ -n "$WD" ] && kill "$WD" 2>/dev/null; rm -rf "$STAGE"; }
+USB_UNBOUND=""; BKMNT=""; usb_restore(){ :; }   # redefined by the USB 3 guard below
+cleanup(){ for m in $FROZEN; do rr fsfreeze -u "$m" 2>/dev/null; done; FROZEN=""; [ -n "$WD" ] && kill "$WD" 2>/dev/null; usb_restore; rm -rf "$STAGE"; }
 trap cleanup EXIT INT TERM
 
 read_blk(){ i2cget -y "$BUS" "$ADDR" 0x00 s 2>/dev/null; }
@@ -55,6 +56,29 @@ b9=$(echo "$blk"|cut -d' ' -f10); [ "$((b9))" -eq "$EXPECT_DEV" ] || { log "devi
 cur=$(( 97 + ($(echo "$blk"|cut -d' ' -f7) & 7) ))
 case "$TARGET" in 100) log "target 100 (stock); nothing to do"; exit 0 ;; 101|102|103|104) ;; *) log "bad target $TARGET"; exit 0 ;; esac
 [ "$cur" -ge "$TARGET" ] && { log "already at ${cur} MHz (>= target ${TARGET})"; echo ok > "$MARK"; exit 0; }
+
+# USB 3 guard (added 2026-11-28): the step upsets the CPU PCIe root port 00:01.0 (USB 3 + Thunderbolt chain).
+# On 2026-11-27 the Fresco FL1100 USB 3 controller logged "AER: can't recover" at the 101->103 step, the MACBACKUP
+# stick dropped a minute later and stayed gone across a warm reboot, PCI reset and port reset (needs a re-plug).
+# So for the step: unmount the backup drive and unbind every xhci controller; rebind + remount afterwards.
+XHCI=$(for d in /sys/bus/pci/drivers/xhci_hcd/0000:*; do [ -e "$d" ] && basename "$d"; done)
+BKMNT=""
+if mountpoint -q /mnt/backup 2>/dev/null; then umount /mnt/backup 2>/dev/null && BKMNT=/mnt/backup; fi
+USB_UNBOUND=""
+for d in $XHCI; do echo "$d" > /sys/bus/pci/drivers/xhci_hcd/unbind 2>/dev/null && USB_UNBOUND="$USB_UNBOUND $d"; done
+[ -n "$USB_UNBOUND$BKMNT" ] && log "USB 3 guard: unbound${USB_UNBOUND:- nothing}${BKMNT:+, unmounted $BKMNT}"
+usb_restore(){
+  [ -n "$USB_UNBOUND" ] || return 0
+  for d in $USB_UNBOUND; do echo "$d" > /sys/bus/pci/drivers/xhci_hcd/bind 2>/dev/null; done; USB_UNBOUND=""
+  if [ -n "$BKMNT" ]; then
+    for _ in $(seq 1 20); do [ -e /dev/disk/by-label/MACBACKUP ] && break; sleep 1; done
+    if mount "$BKMNT" 2>/dev/null; then log "USB 3 guard: controllers rebound, $BKMNT mounted again"
+    else log "USB 3 guard: controllers rebound but $BKMNT did NOT come back (re-plug the MACBACKUP stick)"; fi
+    BKMNT=""
+  fi
+}
+# re-read the rw filesystems (the backup drive is no longer mounted)
+FZ=$(awk '$3 ~ /^(ext4|xfs)$/ && $4 ~ /(^|,)rw(,|$)/ {print $2}' /proc/mounts)
 
 # pre-page the tmpfs tools so the first frozen use never page-faults off a frozen FS
 for t in i2cget i2cset fsfreeze; do rr "$t" --help >/dev/null 2>&1 || true; done; rr sleep 0 2>/dev/null || true
@@ -91,3 +115,4 @@ done
 kill "$WD" 2>/dev/null; WD=""
 echo ok > "$MARK"; sync
 log "done: BCLK now ${cur} MHz"
+usb_restore
